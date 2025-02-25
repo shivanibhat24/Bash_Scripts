@@ -1,7 +1,0 @@
-#!/bin/bash
-while True
-do
-date >> /var/log/fs-montior.txt
-sudo df -h >> /var/log/fs-montior.txt
-sleep 120 #sleeps for 120s
-done
