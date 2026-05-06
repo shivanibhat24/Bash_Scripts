@@ -1,6 +1,5 @@
 # Conway's Game of Life — Bash Edition
 
-**Version 4.0 — "Emergent Complexity"**  
 **Author:** Shivani Bhat
 
 ---
