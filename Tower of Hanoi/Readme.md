@@ -136,14 +136,6 @@ This project is designed to help students and developers deeply understand:
 - Divide and Conquer strategy
 - Time and space complexity
 
----
-
-## License
-
-This project is open-sourced under the **MIT License**. You are free to use, modify, and distribute it for educational and personal purposes.
-
----
-
 **Created by Shivani Bhat**  
 
 ---
