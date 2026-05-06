@@ -1,6 +1,5 @@
 # Tower of Hanoi Recursive Visualizer
 
-**Version 3.1 — "Deep Recursion (Fixed)"**  
 **Author:** Shivani Bhat  
 
 ---
