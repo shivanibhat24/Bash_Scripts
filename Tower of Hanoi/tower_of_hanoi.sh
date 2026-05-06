@@ -17,8 +17,8 @@
 #
 # =============================================================================
 # AUTHOR   : Shivani Bhat
-# VERSION  : 3.0 — "Deep Recursion"
-# REQUIRES : bash >= 4.0  (nameref support), a 256-colour terminal
+# VERSION  : 3.1 — "Deep Recursion (Fixed)"
+# REQUIRES : bash >= 4.3  (nameref support), a 256-colour terminal
 #
 # PURPOSE  : An immersive, fully-annotated Tower of Hanoi solver that
 #            demonstrates RECURSION through live terminal animation.
@@ -56,6 +56,38 @@
 #
 # USAGE
 #   ./tower_of_hanoi.sh [--discs N] [--delay S] [--fast] [--no-stack]
+#
+# BUGS FIXED (v3.0 → v3.1)
+# -------------------------
+# BUG 1 (CRITICAL) — pop() subshell trap:
+#   Original pop() used `printf '%s' "$_top"` as its return mechanism, meaning
+#   callers had to write:  disc=$(pop "$from")
+#   The $(...) command substitution spawns a subshell.  Any array mutations
+#   (the `unset` that shrinks the peg) happen inside that subshell and are
+#   silently discarded when it exits.  Result: the peg arrays never actually
+#   shrank; every "move" read the same top element forever, producing a fully
+#   incorrect solve (all discs reported as disc 1).
+#   FIX: pop() now writes its result to the global variable POPPED and is
+#   called without $(...).  The caller reads $POPPED immediately after.
+#
+# BUG 2 (CRITICAL) — arithmetic increment/decrement under `set -e`:
+#   bash arithmetic commands `(( expr ))` return exit-code 1 whenever the
+#   expression evaluates to zero (false in arithmetic context).  Under `set -e`
+#   this immediately kills the script.  Affected sites:
+#     • `(( RECURSION_DEPTH++ ))` on the very first call (depth was 0)
+#     • `(( MOVE_COUNT++ ))` on the very first move (count was 0)
+#     • `(( RECURSION_DEPTH-- ))` whenever depth returns to 0 after the
+#       outermost frame unwinds
+#     • `(( row++ ))` inside draw_call_stack
+#   FIX: All arithmetic increment/decrement statements are guarded with
+#   `|| true` so a zero result never triggers `set -e`.
+#
+# BUG 3 (MINOR) — nameref unset inside pop():
+#   `unset "_ref[-1]"` attempts to unset a variable literally named _ref[-1]
+#   rather than the last element of the array the nameref points at.
+#   FIX: Changed to `eval "unset '${1}[-1]'"` which correctly expands to
+#   e.g. `unset 'PEG_A[-1]'` at runtime.  (This fix is superseded by BUG 1's
+#   fix but is retained for correctness of the pop() body itself.)
 # =============================================================================
 
 # =============================================================================
@@ -133,7 +165,6 @@ NUM_DISCS=5          # Number of discs to solve (1-8)
 DELAY=0.30           # Seconds to sleep between moves
 SHOW_STACK=1         # 1 = show the recursive call-stack panel
 SKIP=0               # 1 = solve without animation (benchmark mode)
-AUTO_SPEED=0         # 1 = delay auto-adjusts to keep ~60 moves/min
 
 # =============================================================================
 #  GLOBAL STATE
@@ -163,6 +194,23 @@ TERM_COLS=80
 TERM_ROWS=24
 
 # =============================================================================
+#  GLOBAL RETURN VALUE FOR pop()
+#
+#  FIX FOR BUG 1:
+#  pop() formerly used `printf '%s' "$_top"` so callers wrote:
+#      disc=$(pop "$from")
+#  The $(...) command substitution spawns a subshell.  All array mutations
+#  inside pop() (the unset that removes the top element) happen in that
+#  subshell and are lost when it exits — the peg never actually shrinks.
+#
+#  Solution: pop() writes its result here instead of to stdout.
+#  Callers must do:
+#      pop "$peg_name"
+#      disc="$POPPED"
+# =============================================================================
+POPPED=""
+
+# =============================================================================
 #  STACK OPERATIONS
 #  These functions simulate push/pop/peek on named bash arrays.
 #  We use bash namerefs (declare -n) — available since bash 4.3.
@@ -178,18 +226,23 @@ push() {
     eval "$1+=($2)"
 }
 
-# pop <array_name>  --> prints the top value and removes it
+# pop <array_name>
 # -----------------------------------------------------------------------------
-# Uses a nameref so we can modify the caller's array by name.
-# This is the preferred bash 4.x pattern over eval for reads/deletes.
+# Removes the top element of the named array and stores it in $POPPED.
+# Does NOT print anything — see the POPPED global above for rationale.
+#
+# FIX BUG 1: result goes to global POPPED, not stdout.  No subshell needed.
+# FIX BUG 3: uses eval "unset '${1}[-1]'" instead of unset "_ref[-1]".
+#            The nameref form silently unsets a variable called literally
+#            "_ref[-1]" rather than the last element of the target array.
 pop() {
-    local -n _ref="$1"    # nameref: _ref IS PEG_A / PEG_B / PEG_C
-    local _top="${_ref[-1]}"
-    unset "_ref[-1]"
-    printf '%s' "$_top"
+    local -n _ref="$1"
+    POPPED="${_ref[-1]}"
+    eval "unset '${1}[-1]'"
 }
 
 # peek <array_name>  --> prints the top value without removing it
+# (Used for display only; safe with printf since the array is not mutated.)
 peek() {
     local -n _ref="$1"
     printf '%s' "${_ref[-1]:-0}"
@@ -333,20 +386,24 @@ draw_call_stack() {
         else
             printf "${DIM}${CYAN}│ %-28s│${RESET}" "${CALL_STACK[$i]}"
         fi
-        (( row++ ))
+        # FIX BUG 2: (( row++ )) returns exit-code 1 when row was 0.
+        # Although row starts at 4 here (so the immediate risk is low),
+        # guard with || true for robustness and consistency.
+        (( row++ )) || true
     done
 
     # Pad empty rows
     while (( row < 4 + panel_rows )); do
         cursor_to "$row" "$panel_col"
         printf "${DIM}${CYAN}│%30s│${RESET}" ""
-        (( row++ ))
+        (( row++ )) || true
     done
 
     cursor_to "$row" "$panel_col"
     printf "${DIM}${CYAN}└──────────────────────────────┘${RESET}"
 
-    cursor_to $(( row + 1 )) "$panel_col"
+    (( row++ )) || true
+    cursor_to "$row" "$panel_col"
     printf "${DIM}  Frames: %d / %d (max)${RESET}" "$stack_depth" "$NUM_DISCS"
 }
 
@@ -373,9 +430,9 @@ draw_pegs() {
     local peg_col_w=$(( max_discs * 2 + 5 ))
 
     # Copy peg arrays for safe indexing (we don't pop — just read)
-    local -a pa=("${PEG_A[@]}")
-    local -a pb=("${PEG_B[@]}")
-    local -a pc=("${PEG_C[@]}")
+    local -a pa=("${PEG_A[@]+"${PEG_A[@]}"}")
+    local -a pb=("${PEG_B[@]+"${PEG_B[@]}"}")
+    local -a pc=("${PEG_C[@]+"${PEG_C[@]}"}")
     local -a peg_arrays=( "pa" "pb" "pc" )
     local -a peg_names=( "  A   SOURCE  " "  B  AUXILIARY" "  C    DEST   " )
 
@@ -520,9 +577,12 @@ hanoi() {
     local from="$2"  to="$3"  aux="$4"
     local from_lbl="$5"  to_lbl="$6"  aux_lbl="$7"
 
-    # Track recursion depth
-    (( RECURSION_DEPTH++ ))
-    (( RECURSION_DEPTH > MAX_DEPTH_SEEN )) && MAX_DEPTH_SEEN=$RECURSION_DEPTH
+    # FIX BUG 2: Guard all (( expr++ / expr-- )) with || true.
+    # When the expression evaluates to 0 (e.g. depth was 0 before first ++,
+    # or depth returns to 0 on final --), bash returns exit-code 1, which
+    # kills the script under `set -e`.
+    (( RECURSION_DEPTH++ )) || true
+    (( RECURSION_DEPTH > MAX_DEPTH_SEEN )) && MAX_DEPTH_SEEN=$RECURSION_DEPTH || true
 
     # Push this call's description onto the visible call stack
     CALL_STACK+=( "hanoi($n, $from_lbl -> $to_lbl)" )
@@ -537,10 +597,12 @@ hanoi() {
     # stops growing and begins to unwind back upward.
     # =========================================================================
     if (( n == 1 )); then
-        local disc
-        disc=$(pop "$from")       # remove top disc from source
-        push "$to" "$disc"        # place it on destination
-        (( MOVE_COUNT++ ))
+        # FIX BUG 1: Call pop without $(...) so the mutation stays in the
+        # current shell.  Read the moved disc from the global $POPPED.
+        pop "$from"
+        local disc="$POPPED"
+        push "$to" "$disc"
+        (( MOVE_COUNT++ )) || true   # FIX BUG 2: guard increment
 
         if (( SKIP == 0 )); then
             render_frame "$from_lbl" "$to_lbl" "$disc"
@@ -556,7 +618,7 @@ hanoi() {
 
         # Pop this frame off the visible call stack and decrement depth
         unset 'CALL_STACK[-1]'
-        (( RECURSION_DEPTH-- ))
+        (( RECURSION_DEPTH-- )) || true   # FIX BUG 2: guard decrement
         return
     fi
 
@@ -581,11 +643,12 @@ hanoi() {
     #
     # Now that smaller discs are out of the way, we slide the big disc over.
     # This is the single "real move" at this recursion level.
+    # FIX BUG 1: Use pop-without-subshell pattern.
     # -------------------------------------------------------------------------
-    local disc
-    disc=$(pop "$from")
+    pop "$from"
+    local disc="$POPPED"
     push "$to" "$disc"
-    (( MOVE_COUNT++ ))
+    (( MOVE_COUNT++ )) || true   # FIX BUG 2: guard increment
 
     if (( SKIP == 0 )); then
         render_frame "$from_lbl" "$to_lbl" "$disc"
@@ -611,7 +674,7 @@ hanoi() {
 
     # This frame is done — pop it and restore depth counter
     unset 'CALL_STACK[-1]'
-    (( RECURSION_DEPTH-- ))
+    (( RECURSION_DEPTH-- )) || true   # FIX BUG 2: guard decrement
 }
 
 # =============================================================================
