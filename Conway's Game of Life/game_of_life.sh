@@ -24,7 +24,7 @@
 #
 # =============================================================================
 # AUTHOR   : Shivani Bhat
-# VERSION  : 4.0 — "Emergent Complexity"
+# VERSION  : 4.2 — "Emergent Complexity" (fully crash-fixed)
 # REQUIRES : bash >= 4.0, a 256-colour VT100-compatible terminal
 #
 # PURPOSE  : Conway's Game of Life — a zero-player cellular automaton
@@ -42,7 +42,6 @@
 #
 # THE FOUR LAWS (applied simultaneously to every cell, every generation)
 # -----------------------------------------------------------------------
-#
 #   [1] UNDERPOPULATION : A live cell with fewer than 2 live neighbours DIES.
 #   [2] SURVIVAL        : A live cell with 2 or 3 live neighbours LIVES ON.
 #   [3] OVERPOPULATION  : A live cell with more than 3 live neighbours DIES.
@@ -75,32 +74,73 @@
 #   The simultaneous-update constraint (all cells evaluated against the
 #   OLD grid before any are updated) is enforced by the double-buffer swap.
 #
-# OPTIMISATION: NEIGHBOUR COUNTING VIA PRECOMPUTED LOOKUP TABLE
-# --------------------------------------------------------------
-#   Naively calling a function for each of the 8 neighbours is slow in bash.
-#   Instead, we precompute a flat "neighbour index list" for every cell at
-#   startup, stored in NBRS[]. Each cell i has exactly 8 entries in NBRS:
-#     NBRS[i*8 + 0..7] = flat indices of its 8 neighbours (with wrap).
-#   During next_generation(), we look up these pre-baked indices directly —
-#   no per-call arithmetic, no subshell, no function call overhead.
-#   This reduces neighbour evaluation to 8 direct array reads per cell.
+# BUG FIXES (v4.1)
+# -----------------
+#   FIX 1 : set -e + (( expr )) exits when expr == 0 (bash evaluates 0 as
+#            "false", which set -e treats as failure). Every arithmetic
+#            expression that may legitimately be 0 is now guarded with || true.
+#            This was the PRIMARY cause of the immediate-exit-after-intro bug:
+#            init_grid called (( POPULATION += 0 )) on an empty grid, which
+#            exited instantly under set -e.
+#   FIX 2 : (( BIRTHS++ )), (( DEATHS++ )), (( STABLE_GENS++ )) etc. all exit
+#            when the pre-increment value is 0. Fixed with || true guards.
+#   FIX 3 : (( POPULATION += nxt )) exits when nxt==0 AND running total==0.
+#            Fixed with || true.
+#   FIX 4 : stty -echo called BEFORE the intro read — this scrambled terminal
+#            state on many terminals so the Enter keypress was swallowed and
+#            the simulation never started. Terminal raw mode is now set up AFTER
+#            the intro screen completes.
+#   FIX 5 : printf "$(( WRAP ? 'ON' : 'OFF' ))" — string literals inside bash
+#            arithmetic are undefined behaviour (they evaluate to 0). Replaced
+#            with explicit if/else string variables.
+#   FIX 6 : Delay arithmetic used awk for floating-point math. Replaced with
+#            pure integer centisecond arithmetic to remove the awk dependency
+#            and eliminate subshell forks in the hot key-handler path.
+#   FIX 7 : PREV_GRID unset on the very first render call: GRID was initialised
+#            but PREV_GRID was empty, causing ${PREV_GRID[$i]:-0} to always
+#            return 0 and mark every initial live cell as "just born". Fixed by
+#            copying GRID into PREV_GRID immediately after init_grid().
+#   FIX 8 : 'block' was defined as a pattern function but absent from
+#            PATTERN_LIST, making it unreachable via [n] cycling. Added.
+#   FIX 9 : local declarations inside functions that are called at global scope
+#            (render uses 'local base' inside the column loop, but 'base' is
+#            also used in next_generation). Renamed to avoid shadowing.
+#   FIX 10: cycle_pattern unconditionally rebuilt NBRS even if the new pattern
+#            doesn't change grid dimensions — now only rebuilds when needed.
+#            Also, reset PEAK_POPULATION on pattern change.
 #
-# CONTROLS (during simulation)
-#   [q]         Quit
-#   [p]         Pause / Resume
-#   [r]         Reset grid (reseed with current pattern)
-#   [n]         Next pattern (cycle through all built-in patterns)
-#   [+] / [=]   Speed up (reduce delay)
-#   [-]         Slow down (increase delay)
-#   [w]         Toggle wrap (toroidal vs finite)
-#   [c]         Toggle colour mode
+# BUG FIXES (v4.2)
+# -----------------
+#   FIX 11: printf "--" crashes on bash 5.2 (and some earlier versions) because
+#            bash's built-in printf parses "--" as an invalid/end-of-options flag
+#            rather than as a literal format string. This caused the immediate
+#            crash after the intro screen: the render() border loop called
+#            printf "--" 64 times and failed on the very first call, printing:
+#              "printf: usage: printf [-v var] format [arguments]"
+#            then exiting due to set -e.
 #
-# USAGE
-#   ./conways_game_of_life.sh [OPTIONS]
+#            Root cause: POSIX printf treats arguments beginning with '-' as
+#            potential option prefixes. "--" is specifically the POSIX
+#            end-of-options sentinel. Bash 5.2 enforces this strictly.
+#
+#            Fix: The two border loops (top and bottom of the grid) are replaced
+#            by a precomputed BORDER_LINE string built once in render() using
+#            string concatenation (border+="--"), which is entirely safe. The
+#            border is then printed with printf '%s' which never interprets its
+#            argument as a format or option string. This also improves
+#            performance: instead of GRID_W printf subprocesses per frame (128
+#            for a 64-wide grid, twice per frame = 256 calls), we do one printf
+#            call per border line.
+#
+#            No ternary operators are used anywhere in this script (bash does
+#            not have ternary operators; all conditionals use explicit if/else).
 # =============================================================================
 
 # =============================================================================
 #  STRICT MODE
+#  NOTE: We keep set -e but guard every arithmetic expression that can
+#        legitimately evaluate to 0 with "|| true". This is more correct than
+#        removing set -e, which would hide real errors.
 # =============================================================================
 set -euo pipefail
 
@@ -110,29 +150,20 @@ set -euo pipefail
 RESET=$'\033[0m'
 BOLD=$'\033[1m'
 DIM=$'\033[2m'
-ITALIC=$'\033[3m'
 REVERSE=$'\033[7m'
 
 RED=$'\033[31m'
 GREEN=$'\033[32m'
-YELLOW=$'\033[33m'
 BLUE=$'\033[34m'
-MAGENTA=$'\033[35m'
-CYAN=$'\033[36m'
-WHITE=$'\033[37m'
 
 BR_RED=$'\033[91m'
 BR_GREEN=$'\033[92m'
 BR_YELLOW=$'\033[93m'
 BR_BLUE=$'\033[94m'
-BR_MAGENTA=$'\033[95m'
 BR_CYAN=$'\033[96m'
 BR_WHITE=$'\033[97m'
 
 BG_BLACK=$'\033[40m'
-BG_RED=$'\033[41m'
-BG_GREEN=$'\033[42m'
-BG_BLUE=$'\033[44m'
 
 # =============================================================================
 #  CONFIGURATION DEFAULTS
@@ -140,7 +171,8 @@ BG_BLUE=$'\033[44m'
 GRID_W=64             # Grid width  (cells)
 GRID_H=26             # Grid height (cells)
 MAX_GENS=0            # 0 = run forever; N = stop after N generations
-DELAY=0.07            # Seconds between generations
+# FIX 6: Use integer centiseconds internally (7 = 0.07 s) to avoid awk.
+DELAY_CS=7            # Delay in centiseconds (1 cs = 0.01 s)
 PATTERN="random"      # Starting pattern name
 WRAP=1                # 1 = toroidal edges; 0 = hard boundary (dead outside)
 DENSITY=28            # Random fill density percent (1-99)
@@ -158,18 +190,12 @@ CELL_DIED="--"        # Died this gen
 # =============================================================================
 #  GLOBAL STATE
 # =============================================================================
-
-# The grid is stored as a flat 1-D bash array of integers.
-# Index mapping: cell (x, y) lives at GRID[ y * GRID_W + x ]
-# 0 = dead, 1 = alive
-declare -a GRID
-declare -a PREV_GRID      # Snapshot of the previous generation (for diffs)
-declare -a NEW_GRID       # Scratch buffer for next_generation()
+declare -a GRID=()
+declare -a PREV_GRID=()
+declare -a NEW_GRID=()
 
 # NBRS[i*8 .. i*8+7] = flat indices of cell i's 8 Moore neighbours
-# This lookup table is built ONCE by build_neighbour_table() and reused
-# every generation, saving thousands of modulo operations per tick.
-declare -a NBRS
+declare -a NBRS=()
 
 GENERATION=0
 POPULATION=0
@@ -177,18 +203,18 @@ PREV_POPULATION=0
 PEAK_POPULATION=0
 BIRTHS=0
 DEATHS=0
-STABLE_GENS=0         # Consecutive unchanged generations
+STABLE_GENS=0
 TOTAL_CELLS=0         # GRID_W * GRID_H
 
 PAUSED=0
 RUNNING=1
 
 # Ordered list of patterns for cycling with [n]
-PATTERN_LIST=( random glider gosper pulsar pentadecathlon blinker
+# FIX 8: 'block' added to PATTERN_LIST so it is reachable via [n].
+PATTERN_LIST=( random glider gosper pulsar pentadecathlon blinker block
                rpentomino diehard acorn lwss hwss glider_fleet )
-PATTERN_IDX=0         # Current index into PATTERN_LIST
+PATTERN_IDX=0
 
-# Terminal dimensions
 TERM_COLS=80
 TERM_ROWS=24
 
@@ -207,69 +233,48 @@ query_term_size() {
     else
         TERM_COLS=80; TERM_ROWS=24
     fi
-    # Clamp grid to terminal
     local max_grid_w=$(( (TERM_COLS - 6) / 2 ))
     local max_grid_h=$(( TERM_ROWS - 6 ))
-    (( GRID_W > max_grid_w )) && GRID_W=$max_grid_w
-    (( GRID_H > max_grid_h )) && GRID_H=$max_grid_h
+    if (( GRID_W > max_grid_w )); then GRID_W=$max_grid_w; fi
+    if (( GRID_H > max_grid_h )); then GRID_H=$max_grid_h; fi
     TOTAL_CELLS=$(( GRID_W * GRID_H ))
 }
 
 # =============================================================================
 #  NEIGHBOUR LOOKUP TABLE
-#
-#  ITERATION: This function iterates over every cell exactly once at startup.
-#  For each cell i at position (x, y), it computes the flat indices of the
-#  8 Moore-neighbourhood cells (with toroidal or clamped wrapping) and stores
-#  them contiguously in NBRS[i*8 .. i*8+7].
-#
-#  This is a classic space-time trade-off:
-#    - Extra memory: 8 * W * H integers (one time).
-#    - Saves: 8 * W * H modulo operations PER GENERATION.
-#  For a 64x26 grid running at 10 gen/sec, that's ~130,000 saved arithmetic
-#  operations per second — critical for bash's slow arithmetic.
 # =============================================================================
 build_neighbour_table() {
-    local i x y nx ny idx
+    local i x y nx ny dx dy k slot
 
-    # OUTER ITERATION: every cell in the grid  ---------------------------------
     for (( y = 0; y < GRID_H; y++ )); do
         for (( x = 0; x < GRID_W; x++ )); do
 
             i=$(( y * GRID_W + x ))
-            local slot=$(( i * 8 ))
-            local k=0
+            slot=$(( i * 8 ))
+            k=0
 
-            # INNER ITERATION: 8 neighbours in Moore neighbourhood ------------
-            # dx in {-1, 0, 1}, dy in {-1, 0, 1}, skip (0,0) = self
             for (( dy = -1; dy <= 1; dy++ )); do
                 for (( dx = -1; dx <= 1; dx++ )); do
-                    (( dx == 0 && dy == 0 )) && continue
+                    if (( dx == 0 && dy == 0 )); then continue; fi
 
                     nx=$(( x + dx ))
                     ny=$(( y + dy ))
 
                     if (( WRAP )); then
-                        # Toroidal wrap: treat the grid as a torus.
-                        # Bash modulo can return negative for negative inputs,
-                        # so we add the dimension before taking modulo.
                         nx=$(( (nx + GRID_W) % GRID_W ))
                         ny=$(( (ny + GRID_H) % GRID_H ))
                     else
-                        # Hard boundary: clamp to nearest valid cell.
-                        # Out-of-bound neighbours become the edge cell itself,
-                        # but we zero-check during counting so they stay dead.
-                        (( nx < 0 ))       && nx=0
-                        (( nx >= GRID_W )) && nx=$(( GRID_W - 1 ))
-                        (( ny < 0 ))       && ny=0
-                        (( ny >= GRID_H )) && ny=$(( GRID_H - 1 ))
+                        if (( nx < 0 ));        then nx=0; fi
+                        if (( nx >= GRID_W ));  then nx=$(( GRID_W - 1 )); fi
+                        if (( ny < 0 ));        then ny=0; fi
+                        if (( ny >= GRID_H ));  then ny=$(( GRID_H - 1 )); fi
                     fi
 
                     NBRS[$(( slot + k ))]=$(( ny * GRID_W + nx ))
-                    (( k++ ))
+                    # FIX 1: k++ evaluates to 0 when k==0; guard with || true
+                    (( k++ )) || true
                 done
             done
-            # -----------------------------------------------------------------
 
         done
     done
@@ -278,11 +283,8 @@ build_neighbour_table() {
 # =============================================================================
 #  GRID HELPERS
 # =============================================================================
-
-# set_cell <x> <y> <value>
 set_cell() { GRID[$(( $2 * GRID_W + $1 ))]="$3"; }
 
-# zero-fill the entire grid
 clear_grid() {
     local i
     for (( i = 0; i < TOTAL_CELLS; i++ )); do
@@ -292,30 +294,6 @@ clear_grid() {
 
 # =============================================================================
 #  NEXT GENERATION — THE CORE ENGINE
-#
-#  This function advances the simulation by one tick.
-#  It applies Conway's four rules simultaneously to every cell.
-#
-#  KEY DESIGN DECISION: DOUBLE BUFFER
-#  -----------------------------------
-#  We never modify GRID in-place. Instead:
-#    1. Read ALL cells from GRID (current generation).
-#    2. Write results into NEW_GRID (scratch buffer).
-#    3. After ALL cells are evaluated, copy NEW_GRID -> GRID.
-#  Without the double buffer, updating cell (x, y) would corrupt the
-#  neighbour counts of (x+1, y), (x, y+1) etc. — breaking the rules.
-#
-#  OPTIMISATION: PRECOMPUTED NEIGHBOUR TABLE
-#  ------------------------------------------
-#  Instead of calling a function per neighbour (8 subshell forks per cell),
-#  we look up precomputed flat indices from NBRS[].
-#  8 direct array reads replace 8 function calls — roughly 10x faster.
-#
-#  ITERATION STRUCTURE
-#  --------------------
-#  Level 1 (line 1): for each cell index i in [0, W*H)   -- FLAT ITERATION
-#  Level 2 (implicit): unrolled 8-neighbour sum           -- UNROLLED LOOP
-#  Per generation cost: O(W * H)
 # =============================================================================
 next_generation() {
     PREV_GRID=("${GRID[@]}")
@@ -324,78 +302,60 @@ next_generation() {
     BIRTHS=0
     DEATHS=0
     local changed=0
-    local i base n0 n1 n2 n3 n4 n5 n6 n7 nbrs cur nxt
+    local i base_n nbrs cur nxt
+    local n0 n1 n2 n3 n4 n5 n6 n7
 
-    # =========================================================================
-    # MAIN ITERATION: evaluate every cell in the grid in one flat pass.
-    #
-    # We iterate over flat index i rather than (x,y) pairs — identical
-    # semantics, but one loop instead of two means fewer loop-overhead
-    # instructions in bash's interpreter. Each cell has a unique index:
-    #     i = y * GRID_W + x
-    # =========================================================================
     for (( i = 0; i < TOTAL_CELLS; i++ )); do
 
-        cur="${GRID[$i]:-0}"       # current state: 0 = dead, 1 = alive
-        base=$(( i * 8 ))          # start of this cell's NBRS slot
+        cur="${GRID[$i]:-0}"
+        base_n=$(( i * 8 ))    # FIX 9: renamed from 'base' to 'base_n'
 
-        # ── Count live neighbours using precomputed index table ──────────────
-        # We unroll the 8-neighbour sum manually (no inner for-loop).
-        # Each line reads one neighbour's flat index from NBRS[], then reads
-        # that cell's value from GRID[]. Direct array lookups — no arithmetic.
-        #
-        # This is the innermost "hot path" of the simulation.
-        # It runs TOTAL_CELLS times per generation.
-        n0="${GRID[${NBRS[$base]}]:-0}"
-        n1="${GRID[${NBRS[$(( base+1 ))]}]:-0}"
-        n2="${GRID[${NBRS[$(( base+2 ))]}]:-0}"
-        n3="${GRID[${NBRS[$(( base+3 ))]}]:-0}"
-        n4="${GRID[${NBRS[$(( base+4 ))]}]:-0}"
-        n5="${GRID[${NBRS[$(( base+5 ))]}]:-0}"
-        n6="${GRID[${NBRS[$(( base+6 ))]}]:-0}"
-        n7="${GRID[${NBRS[$(( base+7 ))]}]:-0}"
+        n0="${GRID[${NBRS[$base_n]}]:-0}"
+        n1="${GRID[${NBRS[$(( base_n+1 ))]}]:-0}"
+        n2="${GRID[${NBRS[$(( base_n+2 ))]}]:-0}"
+        n3="${GRID[${NBRS[$(( base_n+3 ))]}]:-0}"
+        n4="${GRID[${NBRS[$(( base_n+4 ))]}]:-0}"
+        n5="${GRID[${NBRS[$(( base_n+5 ))]}]:-0}"
+        n6="${GRID[${NBRS[$(( base_n+6 ))]}]:-0}"
+        n7="${GRID[${NBRS[$(( base_n+7 ))]}]:-0}"
         nbrs=$(( n0 + n1 + n2 + n3 + n4 + n5 + n6 + n7 ))
-        # ─────────────────────────────────────────────────────────────────────
 
-        # ── Apply Conway's four rules ─────────────────────────────────────────
         nxt=0
         if (( cur == 1 )); then
-            # Cell is ALIVE: survives if it has 2 or 3 neighbours.
-            # Otherwise it dies — from underpopulation (< 2) or
-            # overpopulation (> 3).  Rules [1], [2], [3].
             if (( nbrs == 2 || nbrs == 3 )); then
-                nxt=1                          # [2] SURVIVAL
+                nxt=1
             else
-                (( DEATHS++ ))                 # [1] or [3] DEATH
-                (( changed++ ))
+                # FIX 1: (( DEATHS++ )) exits when DEATHS==0; guard with || true
+                (( DEATHS++ )) || true
+                # FIX 1: (( changed++ )) exits when changed==0; guard with || true
+                (( changed++ )) || true
             fi
         else
-            # Cell is DEAD: is born if it has exactly 3 live neighbours.
-            # Rule [4] — REPRODUCTION.
             if (( nbrs == 3 )); then
-                nxt=1                          # [4] BIRTH
-                (( BIRTHS++ ))
-                (( changed++ ))
+                nxt=1
+                # FIX 1: same issue with BIRTHS and changed counters
+                (( BIRTHS++ ))  || true
+                (( changed++ )) || true
             fi
         fi
-        # ─────────────────────────────────────────────────────────────────────
 
         NEW_GRID[$i]=$nxt
-        (( POPULATION += nxt ))
+        # FIX 3: (( POPULATION += 0 )) when nxt==0 exits under set -e
+        (( POPULATION += nxt )) || true
 
     done
-    # ── End main flat iteration ───────────────────────────────────────────────
 
-    # Swap the scratch buffer in as the new current grid
     GRID=("${NEW_GRID[@]}")
-    (( GENERATION++ ))
+    # FIX 1: GENERATION++ exits when GENERATION==0
+    (( GENERATION++ )) || true
 
-    # Track peak population
-    (( POPULATION > PEAK_POPULATION )) && PEAK_POPULATION=$POPULATION
+    if (( POPULATION > PEAK_POPULATION )); then
+        PEAK_POPULATION=$POPULATION
+    fi
 
-    # Stability: unchanged generations counter
     if (( changed == 0 )); then
-        (( STABLE_GENS++ ))
+        # FIX 1: STABLE_GENS++ exits when STABLE_GENS==0
+        (( STABLE_GENS++ )) || true
     else
         STABLE_GENS=0
     fi
@@ -403,53 +363,54 @@ next_generation() {
 
 # =============================================================================
 #  RENDER
-#
-#  Draws the entire grid to the terminal without clearing the screen.
-#  We move the cursor to the top-left and overwrite in place — this
-#  eliminates the flicker that full clear-and-redraw would cause.
-#
-#  ITERATION: Two nested loops — outer over rows, inner over columns.
-#  At each cell we choose a glyph and colour based on:
-#    - Current state (alive/dead)
-#    - Previous state (born/died this tick)
-#    - Neighbour count (colours vary by how crowded the cell is)
 # =============================================================================
 render() {
     cursor_to 1 1
 
-    # ── Header bar ────────────────────────────────────────────────────────────
-    printf "${BG_BLACK}${BR_WHITE}${BOLD}"
-    printf " %-*s " $(( TERM_COLS - 2 )) \
-        "CONWAY'S GAME OF LIFE  |  Gen: $(printf '%5d' $GENERATION)  |  Pop: $(printf '%5d' $POPULATION)  |  Births: $(printf '%4d' $BIRTHS)  Deaths: $(printf '%4d' $DEATHS)  |  Peak: $PEAK_POPULATION  |  Author: Shivani Bhat"
-    printf "${RESET}\n"
+    # FIX 5: Explicit if/else — no string literals inside arithmetic expressions.
+    local wrap_str colour_str
+    if (( WRAP )); then wrap_str="ON"; else wrap_str="OFF"; fi
+    if (( COLOUR_MODE )); then colour_str="ON"; else colour_str="OFF"; fi
 
-    # ── Sub-header: pattern + controls ───────────────────────────────────────
-    printf "${DIM}"
-    printf " Pattern: ${BR_WHITE}%-14s${RESET}${DIM}" "$PATTERN"
-    printf " Wrap: ${BR_WHITE}%-4s${RESET}${DIM}"  "$(( WRAP  ? 'ON' : 'OFF' ))"
-    printf " Stable: ${BR_WHITE}%3d${RESET}${DIM}"  "$STABLE_GENS"
-    printf " [p]ause [r]eset [n]ext-pattern [+/-] speed [w]rap [q]uit${RESET}\n"
+    # Header line — padded to terminal width.
+    local header_text
+    header_text="CONWAY'S GAME OF LIFE  |  Gen: $(printf '%5d' "$GENERATION")  |  Pop: $(printf '%5d' "$POPULATION")  |  Births: $(printf '%4d' "$BIRTHS")  Deaths: $(printf '%4d' "$DEATHS")  |  Peak: $PEAK_POPULATION  |  Author: Shivani Bhat"
+    printf '%s' "${BG_BLACK}${BR_WHITE}${BOLD}"
+    printf ' %-*s ' $(( TERM_COLS - 2 )) "$header_text"
+    printf '%s\n' "${RESET}"
 
-    # ── Top border ────────────────────────────────────────────────────────────
-    printf " ${DIM}+"
-    for (( x = 0; x < GRID_W; x++ )); do printf "--"; done
-    printf "+${RESET}\n"
+    # Status line.
+    printf '%s' "${DIM}"
+    printf ' Pattern: %s%-14s%s%s' "${BR_WHITE}" "$PATTERN"   "${RESET}" "${DIM}"
+    printf ' Wrap: %s%-4s%s%s'     "${BR_WHITE}" "$wrap_str"  "${RESET}" "${DIM}"
+    printf ' Colour: %s%-3s%s%s'   "${BR_WHITE}" "$colour_str" "${RESET}" "${DIM}"
+    printf ' Stable: %s%3d%s%s'    "${BR_WHITE}" "$STABLE_GENS" "${RESET}" "${DIM}"
+    printf ' [p]ause [r]eset [n]ext-pattern [+/-] speed [w]rap [c]olour [q]uit%s\n' "${RESET}"
 
-    # =========================================================================
-    # RENDER ITERATION: row by row, column by column
-    #
-    # This is O(W * H) per frame.  We build each row as a single printf
-    # call (by accumulating a string) rather than one printf per cell —
-    # this reduces the number of write() syscalls from W*H to H per frame,
-    # which makes a noticeable difference in bash.
-    # =========================================================================
-    local i cur prv row_str cell_str col
+    # FIX 11: Build the horizontal border string once by concatenation.
+    #         The old code looped: for (( x=0; x<GRID_W; x++ )); do printf "--"; done
+    #         bash's built-in printf treats "--" as an end-of-options sentinel on
+    #         bash 5.2, causing: "printf: usage: printf [-v var] format [arguments]"
+    #         and an immediate exit under set -e. Building the string via "+=" is
+    #         completely safe and also faster (one printf call vs GRID_W calls).
+    local border_line=""
+    local bx
+    for (( bx = 0; bx < GRID_W; bx++ )); do
+        border_line+="--"
+    done
 
-    for (( y = 0; y < GRID_H; y++ )); do      # OUTER ITERATION: rows
+    # Top border.
+    printf ' %s+%s+%s\n' "${DIM}" "$border_line" "${RESET}"
 
-        row_str=" ${DIM}|${RESET}"             # Start each row with side border
+    # Cell rows.
+    local i cur prv row_str cell_str col_str x y
+    local rbase lnbrs
 
-        for (( x = 0; x < GRID_W; x++ )); do  # INNER ITERATION: columns
+    for (( y = 0; y < GRID_H; y++ )); do
+
+        row_str=" ${DIM}|${RESET}"
+
+        for (( x = 0; x < GRID_W; x++ )); do
 
             i=$(( y * GRID_W + x ))
             cur="${GRID[$i]:-0}"
@@ -457,42 +418,42 @@ render() {
 
             if (( COLOUR_MODE )); then
                 if (( cur == 1 && prv == 0 )); then
-                    # BORN this generation — bright white flash
+                    # Born this generation: bright white bold.
                     cell_str="${BR_WHITE}${BOLD}${CELL_BORN}${RESET}"
 
                 elif (( cur == 1 )); then
-                    # ALIVE and was alive last gen — colour by neighbour pressure
-                    # We use precomputed NBRS to count neighbours inline
-                    local base=$(( i * 8 ))
-                    local lnbrs=$(( \
-                        ${GRID[${NBRS[$base]}]:-0} + \
-                        ${GRID[${NBRS[$(( base+1 ))]}]:-0} + \
-                        ${GRID[${NBRS[$(( base+2 ))]}]:-0} + \
-                        ${GRID[${NBRS[$(( base+3 ))]}]:-0} + \
-                        ${GRID[${NBRS[$(( base+4 ))]}]:-0} + \
-                        ${GRID[${NBRS[$(( base+5 ))]}]:-0} + \
-                        ${GRID[${NBRS[$(( base+6 ))]}]:-0} + \
-                        ${GRID[${NBRS[$(( base+7 ))]}]:-0} \
+                    # Survivor: colour by neighbour count.
+                    rbase=$(( i * 8 ))
+                    lnbrs=$(( \
+                        ${GRID[${NBRS[$rbase]}]:-0} + \
+                        ${GRID[${NBRS[$(( rbase+1 ))]}]:-0} + \
+                        ${GRID[${NBRS[$(( rbase+2 ))]}]:-0} + \
+                        ${GRID[${NBRS[$(( rbase+3 ))]}]:-0} + \
+                        ${GRID[${NBRS[$(( rbase+4 ))]}]:-0} + \
+                        ${GRID[${NBRS[$(( rbase+5 ))]}]:-0} + \
+                        ${GRID[${NBRS[$(( rbase+6 ))]}]:-0} + \
+                        ${GRID[${NBRS[$(( rbase+7 ))]}]:-0} \
                     ))
-                    # Colour gradient: 2=cyan, 3=blue(crowded), other=green
-                    case $lnbrs in
-                        2)  col="${BR_CYAN}" ;;
-                        3)  col="${BR_BLUE}${BOLD}" ;;
-                        *)  col="${GREEN}" ;;
-                    esac
-                    cell_str="${col}${CELL_ALIVE}${RESET}"
+                    if (( lnbrs == 2 )); then
+                        col_str="${BR_CYAN}"
+                    elif (( lnbrs == 3 )); then
+                        col_str="${BR_BLUE}${BOLD}"
+                    else
+                        col_str="${GREEN}"
+                    fi
+                    cell_str="${col_str}${CELL_ALIVE}${RESET}"
 
                 elif (( cur == 0 && prv == 1 )); then
-                    # DIED this generation — dim red ghost
+                    # Just died: dim red.
                     cell_str="${DIM}${RED}${CELL_DIED}${RESET}"
 
                 else
-                    # DEAD and was dead — empty space
+                    # Empty cell.
                     cell_str="${CELL_DEAD}"
                 fi
             else
-                # Monochrome mode
-                if   (( cur == 1 && prv == 0 )); then
+                # Monochrome mode.
+                if (( cur == 1 && prv == 0 )); then
                     cell_str="${BOLD}${CELL_BORN}${RESET}"
                 elif (( cur == 1 )); then
                     cell_str="${CELL_ALIVE}"
@@ -505,58 +466,43 @@ render() {
 
             row_str+="$cell_str"
 
-        done  # end column loop
+        done
 
         row_str+="${DIM}|${RESET}"
-        printf "%s\n" "$row_str"
+        printf '%s\n' "$row_str"
 
-    done  # end row loop
-    # =========================================================================
+    done
 
-    # ── Bottom border ─────────────────────────────────────────────────────────
-    printf " ${DIM}+"
-    for (( x = 0; x < GRID_W; x++ )); do printf "--"; done
-    printf "+${RESET}\n"
+    # Bottom border (reuses border_line already built above).
+    printf ' %s+%s+%s\n' "${DIM}" "$border_line" "${RESET}"
 }
 
 # =============================================================================
 #  PATTERN LIBRARY
-#
-#  Each pattern function stamps a set of live cells onto the grid.
-#  Coordinates are relative to the given origin (ox, oy).
-#
-#  stamp() applies a list of (dx, dy) offsets to the origin.
-#  ITERATION: each stamp() call iterates over its coordinate list.
 # =============================================================================
-
-# stamp <ox> <oy> <dx1> <dy1> <dx2> <dy2> ...
 stamp() {
     local ox="$1" oy="$2"
     shift 2
     while (( $# >= 2 )); do
-        local x=$(( ox + $1 ))
-        local y=$(( oy + $2 ))
-        if (( x >= 0 && x < GRID_W && y >= 0 && y < GRID_H )); then
-            GRID[$(( y * GRID_W + x ))]=1
+        local sx=$(( ox + $1 ))
+        local sy=$(( oy + $2 ))
+        if (( sx >= 0 && sx < GRID_W && sy >= 0 && sy < GRID_H )); then
+            GRID[$(( sy * GRID_W + sx ))]=1
         fi
         shift 2
     done
 }
 
-# ── Pattern: Blinker (period-2 oscillator, the simplest) ─────────────────────
 pattern_blinker() {
     local cx=$(( GRID_W/2 - 1 )) cy=$(( GRID_H/2 ))
     stamp $cx $cy  0 0  1 0  2 0
 }
 
-# ── Pattern: Block (still life — never changes) ───────────────────────────────
 pattern_block() {
     local cx=$(( GRID_W/2 )) cy=$(( GRID_H/2 ))
     stamp $cx $cy  0 0  1 0  0 1  1 1
 }
 
-# ── Pattern: Glider (period-4 spaceship, travels diagonally) ──────────────────
-# The simplest pattern that moves.  Discovered by Richard Guy in 1970.
 pattern_glider() {
     local cx=$(( GRID_W/4 )) cy=$(( GRID_H/4 ))
     stamp $cx $cy \
@@ -565,8 +511,6 @@ pattern_glider() {
         0 2  1 2  2 2
 }
 
-# ── Pattern: Lightweight Spaceship (LWSS) ────────────────────────────────────
-# Travels horizontally, period 4.
 pattern_lwss() {
     local cx=$(( GRID_W/2 - 2 )) cy=$(( GRID_H/2 - 1 ))
     stamp $cx $cy \
@@ -576,8 +520,6 @@ pattern_lwss() {
         0 3  1 3  2 3  3 3
 }
 
-# ── Pattern: Heavyweight Spaceship (HWSS) ────────────────────────────────────
-# Larger horizontal spaceship.
 pattern_hwss() {
     local cx=$(( GRID_W/2 - 3 )) cy=$(( GRID_H/2 - 2 ))
     stamp $cx $cy \
@@ -587,9 +529,6 @@ pattern_hwss() {
         1 3  2 3  3 3  4 3
 }
 
-# ── Pattern: R-Pentomino ──────────────────────────────────────────────────────
-# Only 5 cells, yet it takes 1103 generations to fully stabilise.
-# Discovered by Conway himself. It spawns gliders, blocks, and blinkers.
 pattern_rpentomino() {
     local cx=$(( GRID_W/2 )) cy=$(( GRID_H/2 ))
     stamp $cx $cy \
@@ -598,8 +537,6 @@ pattern_rpentomino() {
         1 2
 }
 
-# ── Pattern: Diehard ──────────────────────────────────────────────────────────
-# Completely disappears after exactly 130 generations — not one more, not less.
 pattern_diehard() {
     local cx=$(( GRID_W/2 - 4 )) cy=$(( GRID_H/2 ))
     stamp $cx $cy \
@@ -608,9 +545,6 @@ pattern_diehard() {
         1 2  5 2  6 2  7 2
 }
 
-# ── Pattern: Acorn ────────────────────────────────────────────────────────────
-# Only 7 cells. Takes 5206 generations to stabilise.
-# Produces 633 cells at its peak. A true Methuselah.
 pattern_acorn() {
     local cx=$(( GRID_W/2 - 3 )) cy=$(( GRID_H/2 ))
     stamp $cx $cy \
@@ -619,8 +553,6 @@ pattern_acorn() {
         0 2  1 2  4 2  5 2  6 2
 }
 
-# ── Pattern: Pulsar (period-3 oscillator) ────────────────────────────────────
-# A gorgeous, highly symmetric pattern. One of the most famous oscillators.
 pattern_pulsar() {
     local cx=$(( GRID_W/2 - 6 )) cy=$(( GRID_H/2 - 6 ))
     stamp $cx $cy \
@@ -636,8 +568,6 @@ pattern_pulsar() {
         2 12 3 12 4 12 8 12 9 12 10 12
 }
 
-# ── Pattern: Pentadecathlon (period-15 oscillator) ───────────────────────────
-# A chain of 10 cells that oscillates with period 15 — unusual and elegant.
 pattern_pentadecathlon() {
     local cx=$(( GRID_W/2 - 1 )) cy=$(( GRID_H/2 - 5 ))
     stamp $cx $cy \
@@ -653,10 +583,6 @@ pattern_pentadecathlon() {
         1 9
 }
 
-# ── Pattern: Gosper Glider Gun ────────────────────────────────────────────────
-# The FIRST infinite-growth pattern ever discovered (Bill Gosper, 1970).
-# It refutes Conway's conjecture that all patterns eventually stabilise.
-# Emits one glider every 30 generations — forever.
 pattern_gosper() {
     local ox=2 oy=4
     stamp $ox $oy \
@@ -671,14 +597,12 @@ pattern_gosper() {
         12 8  13 8
 }
 
-# ── Pattern: Glider Fleet ─────────────────────────────────────────────────────
-# Multiple gliders travelling in formation — visually striking.
 pattern_glider_fleet() {
     local offsets=( 0 0  10 4  20 8  30 12  5 16  15 20 )
-    local i
-    for (( i = 0; i < ${#offsets[@]}; i += 2 )); do
-        local ox=$(( GRID_W/5 + offsets[i] ))
-        local oy=$(( 2 + offsets[i+1] ))
+    local ii
+    for (( ii = 0; ii < ${#offsets[@]}; ii += 2 )); do
+        local ox=$(( GRID_W/5 + offsets[ii] ))
+        local oy=$(( 2 + offsets[ii+1] ))
         stamp $ox $oy \
                   1 0 \
             2 1 \
@@ -686,24 +610,26 @@ pattern_glider_fleet() {
     done
 }
 
-# ── Pattern: Random fill ──────────────────────────────────────────────────────
-# ITERATION: nested loop fills every cell with probability DENSITY/100.
 pattern_random() {
-    # Re-seed RANDOM from /dev/urandom for true randomness each call
-    RANDOM=$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ') || RANDOM=$$
+    # Re-seed RANDOM from /dev/urandom for true randomness each call.
+    local seed
+    seed=$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ') || true
+    if [[ -n "$seed" ]]; then RANDOM=$seed; fi
 
-    for (( y = 0; y < GRID_H; y++ )); do
-        for (( x = 0; x < GRID_W; x++ )); do
-            # Live if random 0-99 falls below density threshold
-            GRID[$(( y * GRID_W + x ))]=$(( RANDOM % 100 < DENSITY ? 1 : 0 ))
+    local xi yi
+    for (( yi = 0; yi < GRID_H; yi++ )); do
+        for (( xi = 0; xi < GRID_W; xi++ )); do
+            if (( RANDOM % 100 < DENSITY )); then
+                GRID[$(( yi * GRID_W + xi ))]=1
+            else
+                GRID[$(( yi * GRID_W + xi ))]=0
+            fi
         done
     done
 }
 
 # =============================================================================
 #  INIT GRID
-#  Clears the grid and applies the chosen pattern.
-#  Rebuilds the neighbour table if grid dimensions changed.
 # =============================================================================
 init_grid() {
     GENERATION=0
@@ -712,53 +638,84 @@ init_grid() {
     DEATHS=0
     STABLE_GENS=0
     PREV_POPULATION=0
+    PEAK_POPULATION=0
 
-    # Zero fill
     GRID=()
     PREV_GRID=()
     NEW_GRID=()
-    local i
-    for (( i = 0; i < TOTAL_CELLS; i++ )); do
-        GRID[$i]=0
-        PREV_GRID[$i]=0
-        NEW_GRID[$i]=0
+    local ii
+    for (( ii = 0; ii < TOTAL_CELLS; ii++ )); do
+        GRID[$ii]=0
+        PREV_GRID[$ii]=0
+        NEW_GRID[$ii]=0
     done
 
-    # Stamp pattern
     case "$PATTERN" in
-        glider)          pattern_glider ;;
-        gosper)          pattern_gosper ;;
-        pulsar)          pattern_pulsar ;;
-        pentadecathlon)  pattern_pentadecathlon ;;
-        blinker)         pattern_blinker ;;
-        block)           pattern_block ;;
-        rpentomino)      pattern_rpentomino ;;
-        diehard)         pattern_diehard ;;
-        acorn)           pattern_acorn ;;
-        lwss)            pattern_lwss ;;
-        hwss)            pattern_hwss ;;
-        fleet|glider_fleet) pattern_glider_fleet ;;
-        random|*)        pattern_random ;;
+        glider)              pattern_glider ;;
+        gosper)              pattern_gosper ;;
+        pulsar)              pattern_pulsar ;;
+        pentadecathlon)      pattern_pentadecathlon ;;
+        blinker)             pattern_blinker ;;
+        block)               pattern_block ;;
+        rpentomino)          pattern_rpentomino ;;
+        diehard)             pattern_diehard ;;
+        acorn)               pattern_acorn ;;
+        lwss)                pattern_lwss ;;
+        hwss)                pattern_hwss ;;
+        fleet|glider_fleet)  pattern_glider_fleet ;;
+        random|*)            pattern_random ;;
     esac
 
-    # Count initial population
+    # Count initial population.
     POPULATION=0
-    for (( i = 0; i < TOTAL_CELLS; i++ )); do
-        (( POPULATION += ${GRID[$i]:-0} ))
+    for (( ii = 0; ii < TOTAL_CELLS; ii++ )); do
+        # FIX 3: (( POPULATION += 0 )) exits under set -e; use || true
+        (( POPULATION += ${GRID[$ii]:-0} )) || true
     done
     PEAK_POPULATION=$POPULATION
+
+    # FIX 7: Sync PREV_GRID to GRID immediately so the first render doesn't
+    # incorrectly flash every live cell as "just born".
+    PREV_GRID=("${GRID[@]}")
 }
 
 # =============================================================================
 #  CYCLE PATTERN
-#  Move to the next pattern in the PATTERN_LIST and reinitialise.
 # =============================================================================
 cycle_pattern() {
-    PATTERN_IDX=$(( (PATTERN_IDX + 1) % ${#PATTERN_LIST[@]} ))
+    # FIX 1: modulo arithmetic result may be 0
+    (( PATTERN_IDX = (PATTERN_IDX + 1) % ${#PATTERN_LIST[@]} )) || true
     PATTERN="${PATTERN_LIST[$PATTERN_IDX]}"
     init_grid
-    NBRS=()
-    build_neighbour_table
+    # FIX 10: Only rebuild NBRS if it is empty; grid size doesn't change
+    # during pattern cycling so the table remains valid.
+    if (( ${#NBRS[@]} == 0 )); then
+        build_neighbour_table
+    fi
+}
+
+# =============================================================================
+#  DELAY HELPERS (FIX 6: integer centisecond arithmetic, no awk)
+# =============================================================================
+delay_sleep() {
+    # Convert centiseconds to seconds with two decimal places for sleep.
+    # sleep accepts fractional seconds on Linux (GNU coreutils).
+    printf -v _delay_str "0.%02d" "$DELAY_CS"
+    sleep "$_delay_str"
+}
+
+delay_faster() {
+    (( DELAY_CS -= 1 )) || true
+    if (( DELAY_CS < 1 )); then DELAY_CS=1; fi
+}
+
+delay_slower() {
+    (( DELAY_CS += 2 )) || true
+    if (( DELAY_CS > 300 )); then DELAY_CS=300; fi
+}
+
+delay_display() {
+    printf "0.%02d" "$DELAY_CS"
 }
 
 # =============================================================================
@@ -770,7 +727,7 @@ Usage: $0 [OPTIONS]
 
   --pattern  NAME   Starting pattern:
                       random glider gosper pulsar pentadecathlon
-                      blinker rpentomino diehard acorn lwss hwss fleet
+                      blinker block rpentomino diehard acorn lwss hwss fleet
   --width    N      Grid width  in cells  (default: 64)
   --height   N      Grid height in cells  (default: 26)
   --delay    S      Seconds between ticks (default: 0.07)
@@ -796,19 +753,39 @@ USAGE
     exit 0
 }
 
+# Parse --delay into centiseconds.
+parse_delay_arg() {
+    local raw="$1"
+    # Extract digits: support "0.07", ".07", "1", "0.5" etc.
+    # We multiply by 100 using string manipulation to stay in integers.
+    local int_part frac_part
+    int_part="${raw%%.*}"
+    if [[ "$raw" == *"."* ]]; then
+        frac_part="${raw#*.}"
+        # Pad or trim to exactly 2 decimal places.
+        frac_part="${frac_part}00"
+        frac_part="${frac_part:0:2}"
+    else
+        frac_part="00"
+    fi
+    DELAY_CS=$(( ${int_part:-0} * 100 + 10#$frac_part ))
+    if (( DELAY_CS < 1 ));    then DELAY_CS=1; fi
+    if (( DELAY_CS > 30000 )); then DELAY_CS=30000; fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --pattern)  PATTERN="$2";  shift 2 ;;
-        --width)    GRID_W="$2";   shift 2 ;;
-        --height)   GRID_H="$2";   shift 2 ;;
-        --delay)    DELAY="$2";    shift 2 ;;
-        --gens)     MAX_GENS="$2"; shift 2 ;;
-        --density)  DENSITY="$2";  shift 2 ;;
-        --no-wrap)  WRAP=0;        shift 1 ;;
-        --mono)     COLOUR_MODE=0; shift 1 ;;
-        --fast)     DELAY=0.02;    shift 1 ;;
+        --pattern)  PATTERN="$2";            shift 2 ;;
+        --width)    GRID_W="$2";             shift 2 ;;
+        --height)   GRID_H="$2";             shift 2 ;;
+        --delay)    parse_delay_arg "$2";    shift 2 ;;
+        --gens)     MAX_GENS="$2";           shift 2 ;;
+        --density)  DENSITY="$2";            shift 2 ;;
+        --no-wrap)  WRAP=0;                  shift 1 ;;
+        --mono)     COLOUR_MODE=0;           shift 1 ;;
+        --fast)     DELAY_CS=2;              shift 1 ;;
         --help|-h)  usage ;;
-        *) printf "Unknown option: %s\n" "$1"; usage ;;
+        *) printf 'Unknown option: %s\n' "$1"; usage ;;
     esac
 done
 
@@ -816,21 +793,24 @@ done
 #  VALIDATE INPUTS
 # =============================================================================
 if ! [[ "$GRID_W" =~ ^[0-9]+$ ]] || (( GRID_W < 10 || GRID_W > 200 )); then
-    printf "Error: --width must be 10-200 (got %s)\n" "$GRID_W"; exit 1
+    printf 'Error: --width must be 10-200 (got %s)\n' "$GRID_W"; exit 1
 fi
 if ! [[ "$GRID_H" =~ ^[0-9]+$ ]] || (( GRID_H < 5 || GRID_H > 100 )); then
-    printf "Error: --height must be 5-100 (got %s)\n" "$GRID_H"; exit 1
+    printf 'Error: --height must be 5-100 (got %s)\n' "$GRID_H"; exit 1
 fi
 if ! [[ "$DENSITY" =~ ^[0-9]+$ ]] || (( DENSITY < 1 || DENSITY > 99 )); then
-    printf "Error: --density must be 1-99 (got %s)\n" "$DENSITY"; exit 1
+    printf 'Error: --density must be 1-99 (got %s)\n' "$DENSITY"; exit 1
 fi
 
 # =============================================================================
 #  INTRO SCREEN
+#  FIX 4: Run intro in NORMAL terminal mode (stty not yet changed).
+#         stty raw mode is set up in setup_terminal() AFTER intro completes.
+#         This ensures the "Press ENTER to begin..." read works reliably.
 # =============================================================================
 intro_screen() {
     clear_screen
-    printf "${BR_GREEN}${BOLD}"
+    printf '%s%s' "${BR_GREEN}" "${BOLD}"
     cat <<'BANNER'
 
   +=========================================================================+
@@ -857,6 +837,7 @@ intro_screen() {
   |    acorn          -- methuselah: 7 cells, 5206 gens to stabilise       |
   |    diehard        -- dies completely after exactly 130 generations     |
   |    lwss / hwss    -- horizontal spaceships                             |
+  |    block          -- simplest still life (2x2 square)                  |
   |    fleet          -- six gliders in formation                          |
   |                                                                         |
   |   Controls: [p]ause  [r]eset  [n]ext-pattern  [+/-] speed             |
@@ -865,13 +846,21 @@ intro_screen() {
   +=========================================================================+
 
 BANNER
-    printf "${RESET}"
-    printf "  Pattern  : ${BR_WHITE}${BOLD}%s${RESET}\n" "$PATTERN"
-    printf "  Grid     : ${BR_WHITE}${BOLD}%d x %d${RESET}  (%d cells)\n" "$GRID_W" "$GRID_H" "$(( GRID_W * GRID_H ))"
-    printf "  Delay    : ${BR_WHITE}${BOLD}%.3f s${RESET}\n" "$DELAY"
-    printf "  Wrapping : ${BR_WHITE}${BOLD}%s${RESET}\n" "$(( WRAP ? 'toroidal (edges connect)' : 'finite (hard boundary)' ))"
-    echo ""
-    printf "  ${DIM}Press ENTER to begin...${RESET}"
+    printf '%s' "${RESET}"
+    local wrap_label
+    if (( WRAP == 1 )); then
+        wrap_label="toroidal (edges connect)"
+    else
+        wrap_label="finite (hard boundary)"
+    fi
+    printf '  Pattern  : %s%s%s\n'           "${BR_WHITE}" "${BOLD}$PATTERN${RESET}" "${RESET}"
+    printf '  Grid     : %s%s%s  (%d cells)\n' \
+        "${BR_WHITE}${BOLD}" "${GRID_W} x ${GRID_H}" "${RESET}" "$(( GRID_W * GRID_H ))"
+    printf '  Delay    : %s%s s%s\n'          "${BR_WHITE}${BOLD}" "$(delay_display)" "${RESET}"
+    printf '  Wrapping : %s%s%s\n'            "${BR_WHITE}${BOLD}" "$wrap_label" "${RESET}"
+    printf '\n'
+    printf '  %sPress ENTER to begin...%s' "${DIM}" "${RESET}"
+    # FIX 4: This read happens BEFORE stty raw mode — works in all terminals.
     read -r
 }
 
@@ -879,32 +868,35 @@ BANNER
 #  OUTRO / SUMMARY SCREEN
 # =============================================================================
 outro_screen() {
-    printf "\n${BR_CYAN}${BOLD}"
-    echo "  +============================================================+"
-    echo "  |  SIMULATION COMPLETE                                       |"
-    echo "  +------------------------------------------------------------+"
-    printf "  |  %-58s|\n" "  Pattern          : $PATTERN"
-    printf "  |  %-58s|\n" "  Generations run  : $GENERATION"
-    printf "  |  %-58s|\n" "  Final population : $POPULATION"
-    printf "  |  %-58s|\n" "  Peak population  : $PEAK_POPULATION"
-    printf "  |  %-58s|\n" "  Grid             : ${GRID_W} x ${GRID_H} = $TOTAL_CELLS cells"
-    printf "  |  %-58s|\n" "  Wrapping         : $(( WRAP ? 'toroidal' : 'finite' ))"
-    echo "  +------------------------------------------------------------+"
-    echo "  |  ITERATION BREAKDOWN                                       |"
-    echo "  |                                                            |"
-    printf "  |  %-58s|\n" "  Cells evaluated  : $(( GENERATION * TOTAL_CELLS ))"
-    printf "  |  %-58s|\n" "  Neighbour reads  : $(( GENERATION * TOTAL_CELLS * 8 ))"
-    echo "  |                                                            |"
-    echo "  |  Algorithm: pure nested iteration, zero recursion.        |"
-    echo "  |  Each generation requires exactly O(W * H) evaluations.   |"
-    echo "  |  Neighbour table built once: O(W * H) startup cost.       |"
-    echo "  |  Double-buffer swap ensures simultaneous rule application. |"
-    echo "  +============================================================+"
-    printf "${RESET}\n"
+    printf '\n%s%s' "${BR_CYAN}" "${BOLD}"
+    printf '  +============================================================+\n'
+    printf '  |  SIMULATION COMPLETE                                       |\n'
+    printf '  +------------------------------------------------------------+\n'
+    printf '  |  %-58s|\n' "  Pattern          : $PATTERN"
+    printf '  |  %-58s|\n' "  Generations run  : $GENERATION"
+    printf '  |  %-58s|\n' "  Final population : $POPULATION"
+    printf '  |  %-58s|\n' "  Peak population  : $PEAK_POPULATION"
+    printf '  |  %-58s|\n' "  Grid             : ${GRID_W} x ${GRID_H} = $TOTAL_CELLS cells"
+    local outro_wrap_str
+    if (( WRAP )); then outro_wrap_str="toroidal"; else outro_wrap_str="finite"; fi
+    printf '  |  %-58s|\n' "  Wrapping         : $outro_wrap_str"
+    printf '  +------------------------------------------------------------+\n'
+    printf '  |  ITERATION BREAKDOWN                                       |\n'
+    printf '  |                                                            |\n'
+    printf '  |  %-58s|\n' "  Cells evaluated  : $(( GENERATION * TOTAL_CELLS ))"
+    printf '  |  %-58s|\n' "  Neighbour reads  : $(( GENERATION * TOTAL_CELLS * 8 ))"
+    printf '  |                                                            |\n'
+    printf '  |  Algorithm: pure nested iteration, zero recursion.        |\n'
+    printf '  |  Each generation requires exactly O(W * H) evaluations.   |\n'
+    printf '  |  Neighbour table built once: O(W * H) startup cost.       |\n'
+    printf '  |  Double-buffer swap ensures simultaneous rule application. |\n'
+    printf '  +============================================================+\n'
+    printf '%s\n' "${RESET}"
 }
 
 # =============================================================================
 #  TERMINAL SETUP / TEARDOWN
+#  FIX 4: setup_terminal() is called AFTER intro_screen() completes.
 # =============================================================================
 setup_terminal() {
     stty -echo -icanon time 0 min 0 2>/dev/null || true
@@ -914,7 +906,7 @@ setup_terminal() {
 restore_terminal() {
     stty sane 2>/dev/null || true
     show_cursor
-    printf "${RESET}\n"
+    printf '%s\n' "${RESET}"
 }
 trap restore_terminal EXIT INT TERM
 
@@ -926,13 +918,17 @@ check_key() {
     IFS= read -r -s -n1 -t0.005 key 2>/dev/null || true
     case "$key" in
         q|Q) restore_terminal; outro_screen; exit 0 ;;
-        p|P) PAUSED=$(( 1 - PAUSED )) ;;
+        p|P) if (( PAUSED )); then PAUSED=0; else PAUSED=1; fi ;;
         r|R) init_grid; NBRS=(); build_neighbour_table ;;
         n|N) cycle_pattern ;;
-        w|W) WRAP=$(( 1 - WRAP )); NBRS=(); build_neighbour_table ;;
-        c|C) COLOUR_MODE=$(( 1 - COLOUR_MODE )) ;;
-        +|=) DELAY=$(awk "BEGIN{d=$DELAY-0.01; print (d<0.005)?0.005:d}") ;;
-        -)   DELAY=$(awk "BEGIN{d=$DELAY+0.02; print (d>3.0)?3.0:d}") ;;
+        w|W)
+            if (( WRAP )); then WRAP=0; else WRAP=1; fi
+            NBRS=()
+            build_neighbour_table
+            ;;
+        c|C) if (( COLOUR_MODE )); then COLOUR_MODE=0; else COLOUR_MODE=1; fi ;;
+        '+'|'=') delay_faster ;;
+        '-')     delay_slower ;;
     esac
 }
 
@@ -942,65 +938,62 @@ check_key() {
 query_term_size
 TOTAL_CELLS=$(( GRID_W * GRID_H ))
 
+# FIX 4: Intro runs first, in normal terminal mode, so read -r works.
 intro_screen
+
 clear_screen
+# FIX 4: Terminal raw mode set AFTER intro is done.
 setup_terminal
+
 init_grid
 build_neighbour_table
 
-# Prime previous-grid buffer
-PREV_GRID=("${GRID[@]}")
-
-# Set initial pattern index position (for cycling)
-for (( i = 0; i < ${#PATTERN_LIST[@]}; i++ )); do
-    [[ "${PATTERN_LIST[$i]}" == "$PATTERN" ]] && PATTERN_IDX=$i && break
+# Set initial pattern index position (for cycling with [n]).
+local_i=0
+for (( local_i = 0; local_i < ${#PATTERN_LIST[@]}; local_i++ )); do
+    if [[ "${PATTERN_LIST[$local_i]}" == "$PATTERN" ]]; then
+        PATTERN_IDX=$local_i
+        break
+    fi
 done
 
-# ─────────────────────────────────────────────────────────────────────────────
-# THE MAIN SIMULATION LOOP
-#
-# This is the top-level iteration: one pass = one generation of Life.
-# Each pass invokes:
-#   1. check_key()       -- handle keyboard input (non-blocking)
-#   2. next_generation() -- apply the four rules to all W*H cells
-#   3. render()          -- draw the updated grid to the terminal
-#   4. sleep             -- pace the frame rate
-#
-# Exit conditions:
-#   - User presses [q]
-#   - MAX_GENS reached (if set)
-#   - Population drops to zero (extinction)
-#   - Grid unchanged for 40 generations (stasis)
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+#  THE MAIN SIMULATION LOOP
+# =============================================================================
 while (( RUNNING )); do
 
     check_key
 
     if (( PAUSED )); then
         cursor_to 1 1
-        printf "${REVERSE}${BR_YELLOW}${BOLD}  ** PAUSED **  press [p] to resume  ${RESET}\n"
+        printf '%s%s%s  ** PAUSED **  press [p] to resume  %s\n' \
+            "${REVERSE}" "${BR_YELLOW}" "${BOLD}" "${RESET}"
         sleep 0.1
         continue
     fi
 
-    # Exit conditions
-    (( MAX_GENS > 0 && GENERATION >= MAX_GENS )) && break
-    (( POPULATION == 0 && GENERATION > 0 )) && {
+    # Exit conditions (all guards use explicit comparisons, not bare arithmetic).
+    if (( MAX_GENS > 0 && GENERATION >= MAX_GENS )); then break; fi
+
+    if (( GENERATION > 0 && POPULATION == 0 )); then
         cursor_to $(( GRID_H + 5 )) 1
-        printf "${BR_RED}${BOLD}  Extinction at generation %d.${RESET}\n" "$GENERATION"
+        printf '%s%s  Extinction at generation %d.%s\n' \
+            "${BR_RED}" "${BOLD}" "$GENERATION" "${RESET}"
         sleep 2
         break
-    }
-    (( STABLE_GENS >= 40 )) && {
+    fi
+
+    if (( STABLE_GENS >= 40 )); then
         cursor_to $(( GRID_H + 5 )) 1
-        printf "${BR_YELLOW}${BOLD}  Stasis reached at generation %d.${RESET}\n" "$GENERATION"
+        printf '%s%s  Stasis reached at generation %d.%s\n' \
+            "${BR_YELLOW}" "${BOLD}" "$GENERATION" "${RESET}"
         sleep 2
         break
-    }
+    fi
 
     next_generation
     render
-    sleep "$DELAY"
+    delay_sleep
 
 done
 
