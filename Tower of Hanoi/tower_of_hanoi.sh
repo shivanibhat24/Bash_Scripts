@@ -17,7 +17,6 @@
 #
 # =============================================================================
 # AUTHOR   : Shivani Bhat
-# VERSION  : 3.1 — "Deep Recursion (Fixed)"
 # REQUIRES : bash >= 4.3  (nameref support), a 256-colour terminal
 #
 # PURPOSE  : An immersive, fully-annotated Tower of Hanoi solver that
@@ -57,37 +56,6 @@
 # USAGE
 #   ./tower_of_hanoi.sh [--discs N] [--delay S] [--fast] [--no-stack]
 #
-# BUGS FIXED (v3.0 → v3.1)
-# -------------------------
-# BUG 1 (CRITICAL) — pop() subshell trap:
-#   Original pop() used `printf '%s' "$_top"` as its return mechanism, meaning
-#   callers had to write:  disc=$(pop "$from")
-#   The $(...) command substitution spawns a subshell.  Any array mutations
-#   (the `unset` that shrinks the peg) happen inside that subshell and are
-#   silently discarded when it exits.  Result: the peg arrays never actually
-#   shrank; every "move" read the same top element forever, producing a fully
-#   incorrect solve (all discs reported as disc 1).
-#   FIX: pop() now writes its result to the global variable POPPED and is
-#   called without $(...).  The caller reads $POPPED immediately after.
-#
-# BUG 2 (CRITICAL) — arithmetic increment/decrement under `set -e`:
-#   bash arithmetic commands `(( expr ))` return exit-code 1 whenever the
-#   expression evaluates to zero (false in arithmetic context).  Under `set -e`
-#   this immediately kills the script.  Affected sites:
-#     • `(( RECURSION_DEPTH++ ))` on the very first call (depth was 0)
-#     • `(( MOVE_COUNT++ ))` on the very first move (count was 0)
-#     • `(( RECURSION_DEPTH-- ))` whenever depth returns to 0 after the
-#       outermost frame unwinds
-#     • `(( row++ ))` inside draw_call_stack
-#   FIX: All arithmetic increment/decrement statements are guarded with
-#   `|| true` so a zero result never triggers `set -e`.
-#
-# BUG 3 (MINOR) — nameref unset inside pop():
-#   `unset "_ref[-1]"` attempts to unset a variable literally named _ref[-1]
-#   rather than the last element of the array the nameref points at.
-#   FIX: Changed to `eval "unset '${1}[-1]'"` which correctly expands to
-#   e.g. `unset 'PEG_A[-1]'` at runtime.  (This fix is superseded by BUG 1's
-#   fix but is retained for correctness of the pop() body itself.)
 # =============================================================================
 
 # =============================================================================
